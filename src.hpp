@@ -8,137 +8,97 @@ void Calculate(std::vector<Matrix *> keys, std::vector<Matrix *> values,
   assert(keys.size() == values.size());
   for (size_t i = 0; i < keys.size(); ++i) {
     auto current_query = rater.GetNextQuery();
-    /*
-     * Implement your calculation logic here.
-     * You can use the GpuSimulator instance to perform matrix operations.
-     * For example:
-     * gpu_sim.MoveMatrixToGpuHbm(keys[i]);
-     * When your need a new matrix, to avoid memory leak, you should use
-     * Matrix* new_matrix =
-     * matrix_memory_allocator.Allocate(YOUR_MATRIX_NAME(string, which is
-     * helpful for debugging)); It can manage the memory of matrices
-     * automatically.
-     */
 
-    // Round i (0-indexed in loop) processes keys[0..i] and values[0..i]
-    // current_query has shape [i+1, d] where d=512
     size_t num_kv = i + 1;
     size_t d = 512;
 
-    // Step 1: Concatenate all keys into K_all (shape [i+1, d])
-    // Each key[j] is [1, d], concat along axis 0 to get [i+1, d]
+    // Step 1: Build K_all by concatenating keys in SRAM
     Matrix *K_all = nullptr;
     for (size_t j = 0; j <= i; ++j) {
+      Matrix *key_copy = matrix_memory_allocator.Allocate("key_copy");
+      gpu_sim.Copy(keys[j], key_copy, Position::kInGpuHbm);
+      gpu_sim.MoveMatrixToSharedMem(key_copy);
+
       if (K_all == nullptr) {
-        // First key, copy it
-        K_all = matrix_memory_allocator.Allocate("K_all");
-        gpu_sim.Copy(keys[j], K_all, Position::kInGpuHbm);
+        K_all = key_copy;
       } else {
-        // Concatenate with previous keys
         Matrix *new_K_all = matrix_memory_allocator.Allocate("K_all_new");
-        gpu_sim.Concat(K_all, keys[j], new_K_all, 0, Position::kInGpuHbm);
+        gpu_sim.Concat(K_all, key_copy, new_K_all, 0, Position::kInSharedMemory);
         gpu_sim.ReleaseMatrix(K_all);
+        gpu_sim.ReleaseMatrix(key_copy);
         K_all = new_K_all;
       }
     }
 
-    // Step 2: Compute Q * K^T
-    // Q: [i+1, d], K_all: [i+1, d], K_all^T: [d, i+1]
-    // Q * K^T: [i+1, d] * [d, i+1] = [i+1, i+1]
+    // Step 2: Compute Q * K^T in SRAM
     gpu_sim.MoveMatrixToSharedMem(current_query);
-    gpu_sim.MoveMatrixToSharedMem(K_all);
     gpu_sim.Transpose(K_all, Position::kInSharedMemory);
 
     Matrix *QK = matrix_memory_allocator.Allocate("QK");
     gpu_sim.MatMul(current_query, K_all, QK);
+    gpu_sim.ReleaseMatrix(K_all);
 
-    // Step 3: Apply row-wise softmax on QK
-    // QK is [i+1, i+1], need to apply softmax to each row
+    // Step 3: Row-wise softmax in SRAM
     Matrix *QK_exp = matrix_memory_allocator.Allocate("QK_exp");
     gpu_sim.MatExp(QK, QK_exp);
     gpu_sim.ReleaseMatrix(QK);
 
-    // Now need to compute row sums and divide each row by its sum
-    // Reshape QK_exp to process more easily
-    // QK_exp: [i+1, i+1]
-
-    Matrix *softmax_QK = matrix_memory_allocator.Allocate("softmax_QK");
-
-    // For each row i, we need to:
-    // 1. Get row i
-    // 2. Compute sum of that row
-    // 3. Divide each element by the sum
-
-    Matrix *first_row = nullptr;
+    // Build softmax result row by row in SRAM
+    Matrix *softmax_QK = nullptr;
     for (size_t row_idx = 0; row_idx < num_kv; ++row_idx) {
-      // Get row
-      Matrix *row = matrix_memory_allocator.Allocate("row_" + std::to_string(row_idx));
+      Matrix *row = matrix_memory_allocator.Allocate("row");
       gpu_sim.GetRow(QK_exp, row_idx, row, Position::kInSharedMemory);
 
-      // Compute sum of this row
-      Matrix *row_sum = matrix_memory_allocator.Allocate("row_sum_" + std::to_string(row_idx));
+      Matrix *row_sum = matrix_memory_allocator.Allocate("row_sum");
       gpu_sim.Sum(row, row_sum);
 
-      // Divide row by sum
-      Matrix *normalized_row = matrix_memory_allocator.Allocate("norm_row_" + std::to_string(row_idx));
+      Matrix *normalized_row = matrix_memory_allocator.Allocate("norm_row");
       gpu_sim.MatDiv(row, row_sum, normalized_row);
 
       gpu_sim.ReleaseMatrix(row);
       gpu_sim.ReleaseMatrix(row_sum);
 
-      // Concatenate rows to build softmax_QK
-      if (first_row == nullptr) {
-        first_row = normalized_row;
+      if (softmax_QK == nullptr) {
+        softmax_QK = normalized_row;
       } else {
-        Matrix *new_softmax = matrix_memory_allocator.Allocate("softmax_concat");
-        gpu_sim.MoveMatrixToGpuHbm(first_row);
-        gpu_sim.MoveMatrixToGpuHbm(normalized_row);
-        gpu_sim.Concat(first_row, normalized_row, new_softmax, 0, Position::kInGpuHbm);
-        gpu_sim.ReleaseMatrix(first_row);
+        Matrix *new_softmax = matrix_memory_allocator.Allocate("softmax_new");
+        gpu_sim.Concat(softmax_QK, normalized_row, new_softmax, 0, Position::kInSharedMemory);
+        gpu_sim.ReleaseMatrix(softmax_QK);
         gpu_sim.ReleaseMatrix(normalized_row);
-        first_row = new_softmax;
+        softmax_QK = new_softmax;
       }
     }
-
-    softmax_QK = first_row;
     gpu_sim.ReleaseMatrix(QK_exp);
 
-    // Step 4: Concatenate all values into V_all
+    // Step 4: Build V_all in SRAM
     Matrix *V_all = nullptr;
     for (size_t j = 0; j <= i; ++j) {
+      Matrix *value_copy = matrix_memory_allocator.Allocate("value_copy");
+      gpu_sim.Copy(values[j], value_copy, Position::kInGpuHbm);
+      gpu_sim.MoveMatrixToSharedMem(value_copy);
+
       if (V_all == nullptr) {
-        V_all = matrix_memory_allocator.Allocate("V_all");
-        gpu_sim.Copy(values[j], V_all, Position::kInGpuHbm);
+        V_all = value_copy;
       } else {
         Matrix *new_V_all = matrix_memory_allocator.Allocate("V_all_new");
-        gpu_sim.Concat(V_all, values[j], new_V_all, 0, Position::kInGpuHbm);
+        gpu_sim.Concat(V_all, value_copy, new_V_all, 0, Position::kInSharedMemory);
         gpu_sim.ReleaseMatrix(V_all);
+        gpu_sim.ReleaseMatrix(value_copy);
         V_all = new_V_all;
       }
     }
 
-    // Step 5: Result = softmax(QK) * V_all
-    gpu_sim.MoveMatrixToSharedMem(softmax_QK);
-    gpu_sim.MoveMatrixToSharedMem(V_all);
-
+    // Step 5: Final multiplication in SRAM
     Matrix *result = matrix_memory_allocator.Allocate("result");
     gpu_sim.MatMul(softmax_QK, V_all, result);
 
+    gpu_sim.ReleaseMatrix(softmax_QK);
+    gpu_sim.ReleaseMatrix(V_all);
+    gpu_sim.MoveMatrixToGpuHbm(current_query);
     gpu_sim.MoveMatrixToGpuHbm(result);
 
     gpu_sim.Run(false, &matrix_memory_allocator);
     rater.CommitAnswer(*result);
-    /*********************  End of your code *********************/
-  
-    /*
-     * If you want to print debug information, you can use:
-     * gpu_sim.Run(true, &matrix_memory_allocator);
-     * At the end of your calculation, you should commit the answer:
-     * rater.CommitAnswer(YOUR_ANSWER_MATRIX) in each iteration.
-     * Your answer matrix should be in GPU HBM.
-     * After the answer is committed, the answer matrix will be released
-     * automatically.
-     */
   }
 }
 
